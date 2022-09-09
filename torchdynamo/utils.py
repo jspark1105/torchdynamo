@@ -701,7 +701,7 @@ def same(
                     exact_dtype=exact_dtype,
                 )
             ):
-                log.info("Accuracy failed for key name", k)
+                log.error(f"Accuracy failed for key name {k}")
                 return False
         return True
     elif isinstance(ref, torch.Tensor):
@@ -735,19 +735,20 @@ def same(
             if fp64_ref.dtype == torch.float64:
                 ref_error = rmse(fp64_ref, ref).item()
                 res_error = rmse(fp64_ref, res).item()
-                multiplier = 1.1
-
-                if fp64_ref.numel() < 500:
-                    # In the presence of noise, noise might dominate our error
-                    # metric for smaller tensors.
-                    multiplier = 2
+                multiplier = 2
 
                 passes_test = res_error <= (multiplier * ref_error + 1e-5)
                 if not passes_test:
-                    log.warning(
+                    log.error(
                         f"RMSE (res-fp64): {res_error:.5f}, (ref-fp64): {ref_error:.5f}"
                     )
+                    if torch.allclose(res, ref * 2, rtol=tol, atol=tol):
+                        log.error(
+                            "Possible double grad accumulation. res is twice of ref"
+                        )
+                    # import pdb; pdb.set_trace()
                 return passes_test
+            # import pdb; pdb.set_trace()
 
             return False
     elif isinstance(ref, (str, int, type(None), bool, torch.device)):
