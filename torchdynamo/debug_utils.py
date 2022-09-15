@@ -36,8 +36,14 @@ class NNModuleToString:
         torch.nn.Dropout,
         torch.nn.Softmax,
         torch.nn.ReLU,
+        torch.nn.GELU,
+        torch.nn.Identity,
         torch.nn.MaxPool2d,
         torch.nn.Embedding,
+        torch.nn.Tanh,
+        torch.nn.ConvTranspose1d,
+        torch.nn.GLU,
+        torch.nn.LSTM,
     ]
 
     @staticmethod
@@ -315,6 +321,10 @@ def wrap_compiler_debug(compiler, compiler_name: str):
         orig_graph = copy.deepcopy(gm.graph)
         assert config.repro_after in ("dynamo", "aot", None)
         if config.repro_after == "aot":
+            if config.repro_level > 1:
+                dump_to_minify(
+                    fx.GraphModule(gm, orig_graph), example_inputs, compiler_name
+                )
             try:
                 compiled_fn = compiler(gm, example_inputs, **kwargs)
                 compiled_fn(*example_inputs)
@@ -351,9 +361,7 @@ def run_fwd_maybe_bwd(gm, args):
     if requires_bwd_pass(out):
         loss = reduce_to_scalar_loss(out)
         loss.backward()
-        return collect_results(gm, out, loss, [])
-    else:
-        return out
+    return collect_results(gm, out, None, [])
 
 
 def same_two_models(gm, opt_gm, example_inputs):
@@ -394,49 +402,86 @@ def cast_to_fp64(model, inputs):
     return cast_to(torch.float64, model, inputs)
 
 
+class ReproStringAfterDynamo:
+    def __init__(self, model_str, compiler_name):
+        self.repro_level = config.repro_level
+        self.model_str = model_str
+        self.compiler_name = compiler_name
+
+    def gen_imports(self):
+        return textwrap.dedent(
+            """
+            import torch
+            import torchdynamo
+            from torch import tensor, device
+            import torch.fx as fx
+            from torchdynamo.testing import rand_strided
+            from math import inf
+            from torchdynamo.debug_utils import run_fwd_maybe_bwd
+            from torchdynamo.debug_utils import same_two_models
+            """
+        )
+
+    def prep_inputs(self, args):
+        return textwrap.dedent(
+            f"""
+            args = {[(tuple(a.shape), tuple(a.stride()), a.dtype, a.device.type, a.requires_grad) for a in args]}
+            args = [rand_strided(sh, st, dt, dev).requires_grad_(rg) for (sh, st, dt, dev, rg) in args]
+
+            """
+        )
+
+    def init_module(self):
+        setup_module = textwrap.dedent(
+            f"""
+            mod = Repro().cuda()
+            opt_mod = torchdynamo.optimize("{self.compiler_name}")(mod)
+
+            """
+        )
+
+        if self.repro_level == 3:
+            setup_module += textwrap.dedent(
+                """
+                mod.eval()
+                opt_mod.eval()
+                """
+            )
+        return setup_module
+
+    def run_module(self):
+        if self.repro_level == 3:
+            return textwrap.dedent(
+                f"""
+                with torch.cuda.amp.autocast(enabled={torch.is_autocast_enabled()}):
+                    assert same_two_models(mod, mod, args), "Eager itself failed"
+                    assert same_two_models(mod, opt_mod, args), "Dynamo failed"
+                """
+            )
+        else:
+            return textwrap.dedent(
+                f"""
+                with torch.cuda.amp.autocast(enabled={torch.is_autocast_enabled()}):
+                    ref = run_fwd_maybe_bwd(mod, args)
+                    res = run_fwd_maybe_bwd(opt_mod, args)
+                """
+            )
+
+    def gen(self, args):
+        return (
+            self.gen_imports()
+            + self.prep_inputs(args)
+            + self.model_str
+            + self.init_module()
+            + self.run_module()
+        )
+
+
 def generate_dynamo_fx_repro_string(model_str, args, compiler_name):
     """
     Generate a repro string for backend-agnostic minified version.
     """
-
-    imports = textwrap.dedent(
-        """
-        import torch
-        import torchdynamo
-        from torch import tensor, device
-        import torch.fx as fx
-        from torchdynamo.testing import rand_strided
-        from math import inf
-        from torchdynamo.debug_utils import run_fwd_maybe_bwd
-
-        """
-    )
-
-    prep_inputs = textwrap.dedent(
-        f"""
-        args = {[(tuple(a.shape), tuple(a.stride()), a.dtype, a.device.type, a.requires_grad) for a in args]}
-        args = [rand_strided(sh, st, dt, dev).requires_grad_(rg) for (sh, st, dt, dev, rg) in args]
-
-        """
-    )
-
-    setup_module = textwrap.dedent(
-        f"""
-        mod = Repro().cuda()
-        opt_mod = torchdynamo.optimize("{compiler_name}")(mod)
-
-        """
-    )
-
-    run_module = textwrap.dedent(
-        f"""
-        with torch.cuda.amp.autocast(enabled={torch.is_autocast_enabled()}):
-            ref = run_fwd_maybe_bwd(mod, args)
-            res = run_fwd_maybe_bwd(opt_mod, args)
-        """
-    )
-
-    return imports + model_str + setup_module + prep_inputs + run_module
+    return ReproStringAfterDynamo(model_str, compiler_name).gen(args)
 
 
 def dump_backend_repro_as_file(gm, args, compiler_name):
@@ -522,6 +567,11 @@ def dump_backend_state(gm, args, compiler_name):
     return dump_backend_repro_as_tarfile(gm, args, compiler_name)
 
 
+def backend_accuracy_fails(gm, example_inputs, compiler_fn, orig_failure):
+    compiled_gm = compiler_fn(copy.deepcopy(gm), clone_inputs(example_inputs))
+    return not same_two_models(gm, compiled_gm, example_inputs)
+
+
 def backend_fails(gm, example_inputs, compiler_fn, orig_failure):
     """
     Minifier uses this function to identify if the minified graph module fails
@@ -564,35 +614,21 @@ def wrap_backend_debug(compiler_fn, compiler_name: str):
         if config.repro_after == "dynamo":
             # Ensure that we fail when backend fails
             config.raise_on_backend_error = True
-            try:
+
+            log.warning("Saving the original module incase module fails with segfault")
+            dump_state_fn = functools.partial(
+                dump_backend_state, compiler_name=compiler_name
+            )
+            dump_state_fn(fx.GraphModule(gm, copy.deepcopy(gm.graph)), example_inputs)
+            if config.repro_level == 3:
+                # Check Accuracy
                 compiled_gm = compiler_fn(gm, example_inputs, **kwargs)
-                run_fwd_maybe_bwd(compiled_gm, clone_inputs(example_inputs))
-            except Exception as exc:
-                orig_failure = str(exc)
-                log.warning(
-                    f"Compiled Fx GraphModule failed with {orig_failure}. Starting minifier."
-                )
-                dump_state_fn = functools.partial(
-                    dump_backend_state, compiler_name=compiler_name
-                )
-                dump_state_fn(
-                    fx.GraphModule(gm, copy.deepcopy(gm.graph)), example_inputs
-                )
-                if config.repro_level > 1:
-                    # As opposed to using dump_to_minify, like we do in
-                    # wrap_compiler_debug, we directly run minifier here. This
-                    # is because we can't serialize compiler_fn here.
-
-                    # The minified version uses
-                    # torchdynamo.optimize(compiler_str) to repro the error.
-
-                    # Directly running the minifier could be bad if something
-                    # goes bad while minification is running. We will have to
-                    # investigate how to add isolation.
+                if backend_accuracy_fails(gm, example_inputs, compiler_fn, None):
+                    log.warning("Accuracy failed for the TorchDyanmo produced graph")
                     fails_fn = functools.partial(
-                        backend_fails,
+                        backend_accuracy_fails,
                         compiler_fn=compiler_fn,
-                        orig_failure=orig_failure,
+                        orig_failure=None,
                     )
                     minifier(
                         gm,
@@ -600,7 +636,39 @@ def wrap_backend_debug(compiler_fn, compiler_name: str):
                         module_fails=fails_fn,
                         dump_state=dump_state_fn,
                     )
-                    raise exc
+                    raise RuntimeError("Bad accuracy")
+            else:
+                try:
+                    compiled_gm = compiler_fn(gm, example_inputs, **kwargs)
+                    run_fwd_maybe_bwd(compiled_gm, clone_inputs(example_inputs))
+                except Exception as exc:
+                    orig_failure = str(exc)
+                    log.warning(
+                        f"Compiled Fx GraphModule failed with {orig_failure}. Starting minifier."
+                    )
+                    if config.repro_level > 1:
+                        # As opposed to using dump_to_minify, like we do in
+                        # wrap_compiler_debug, we directly run minifier here. This
+                        # is because we can't serialize compiler_fn here.
+
+                        # The minified version uses
+                        # torchdynamo.optimize(compiler_str) to repro the error.
+
+                        # Directly running the minifier could be bad if something
+                        # goes bad while minification is running. We will have to
+                        # investigate how to add isolation.
+                        fails_fn = functools.partial(
+                            backend_fails,
+                            compiler_fn=compiler_fn,
+                            orig_failure=orig_failure,
+                        )
+                        minifier(
+                            gm,
+                            example_inputs,
+                            module_fails=fails_fn,
+                            dump_state=dump_state_fn,
+                        )
+                        raise exc
         else:
             compiled_gm = compiler_fn(gm, example_inputs, **kwargs)
 
